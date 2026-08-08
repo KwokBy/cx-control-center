@@ -25,9 +25,16 @@ export interface Account {
   remainingPercent?: number;
   cooldownUntil?: string;
   activeSessions: number;
+  sharedSessionsReady?: boolean;
 }
 
 export interface Overview {
   sessions: Session[];
   accounts: Account[];
+}
+
+export interface SupervisorTick {
+  changedSessions: Session[];
+  changedAccounts: Account[];
+  notices: string[];
 }
