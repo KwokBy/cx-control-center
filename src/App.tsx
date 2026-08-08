@@ -1,144 +1,58 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, CirclePause, Cpu, Gauge, GitBranch, Plus, RefreshCw, RotateCw, Server, Settings, ShieldCheck, TerminalSquare, Zap } from "lucide-react";
-import { addAccount, getOverview, scanExisting, setAutoFailover, switchAccount } from "./api";
+import { Activity, Gauge, Plus, RefreshCw, RotateCw, Server, Settings, ShieldCheck, Zap } from "lucide-react";
+import { addAccount, attachSession, getOverview, prepareAccount, scanExisting, setAutoFailover, supervisorTick, switchAccount } from "./api";
 import type { Account, Overview, Session } from "./types";
 
-const statusLabel: Record<Session["status"], string> = {
-  running: "Running",
-  recovering: "Recovering",
-  paused: "Paused",
-  failed: "Failed",
-  completed: "Completed",
-};
+const parsedTime = (value: string) => value.startsWith("unix:") ? Number(value.slice(5)) * 1000 : new Date(value).getTime();
+const timeAgo = (value: string) => { const d = Math.max(0, Date.now() - parsedTime(value)); return d < 60_000 ? `${Math.floor(d/1000)}s ago` : d < 3_600_000 ? `${Math.floor(d/60_000)}m ago` : `${Math.floor(d/3_600_000)}h ago`; };
 
-function timeAgo(iso: string) {
-  const diff = Math.max(0, Date.now() - new Date(iso).getTime());
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  return `${Math.floor(diff / 3_600_000)}h ago`;
+function Sidebar({ active, setActive }: { active: string; setActive: (x:string)=>void }) {
+  return <aside className="sidebar"><div className="brand"><div className="brand-mark">CX</div><div><strong>Control Center</strong><small>Codex orchestration</small></div></div><nav>
+    <button className={active==="sessions"?"active":""} onClick={()=>setActive("sessions")}><Activity size={18}/>Sessions</button>
+    <button className={active==="accounts"?"active":""} onClick={()=>setActive("accounts")}><Server size={18}/>Accounts</button>
+    <button className={active==="settings"?"active":""} onClick={()=>setActive("settings")}><Settings size={18}/>Settings</button>
+  </nav><div className="sidebar-footer"><span className="pulse"/> supervisor ready</div></aside>;
 }
 
-function StatusDot({ status }: { status: Session["status"] }) {
-  return <span className={`status-dot ${status}`} />;
+function Badge({ account }: { account?: Account }) { return account ? <span className={`chip ${account.status}`}>{account.name}</span> : <span className="chip muted">unassigned</span>; }
+
+function AttachModal({ found, accounts, close, attached }: { found: Session[]; accounts: Account[]; close:()=>void; attached:(s:Session)=>void }) {
+  const [pid,setPid]=useState(found[0]?.pid || 0); const runtime=found.find(x=>x.pid===pid) || found[0];
+  const [name,setName]=useState(runtime?.name || ""); const [projectPath,setProjectPath]=useState(runtime?.projectPath || ""); const [threadId,setThreadId]=useState(""); const [accountId,setAccountId]=useState(accounts[0]?.id || ""); const [error,setError]=useState("");
+  if(!runtime) return null;
+  return <div className="modal-backdrop"><div className="page-card modal-card"><div className="page-title"><div><div className="eyebrow">ATTACH EXISTING</div><h1>Take over a running session</h1><p>Attach is non-destructive. CX only records enough identity to recover this task later.</p></div></div>
+    <div className="settings-grid"><div className="wide"><label>Detected runtime</label><select value={pid} onChange={e=>{const p=Number(e.target.value);setPid(p);const r=found.find(x=>x.pid===p);if(r){setName(r.name);setProjectPath(r.projectPath)}}}>{found.map(x=><option key={x.pid} value={x.pid}>{x.runtime} · PID {x.pid} · {x.projectPath}</option>)}</select></div>
+      <div><label>Name</label><input value={name} onChange={e=>setName(e.target.value)}/></div><div><label>Current account</label><select value={accountId} onChange={e=>setAccountId(e.target.value)}><option value="">Select</option>{accounts.map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select></div>
+      <div className="wide"><label>Project path</label><input value={projectPath} onChange={e=>setProjectPath(e.target.value)}/></div><div className="wide"><label>Thread / session ID</label><input placeholder="Codex UUID" value={threadId} onChange={e=>setThreadId(e.target.value)}/></div></div>
+    {error && <p className="error-text">{error}</p>}<div className="modal-actions"><button className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={!threadId||!accountId||!projectPath} onClick={async()=>{try{attached(await attachSession({pid:runtime.pid!,name,projectPath,threadId,accountId,runtime:runtime.runtime}));close()}catch(e){setError(String(e))}}}>Attach</button></div>
+  </div></div>;
 }
 
-function Sidebar({ active, onChange }: { active: string; onChange: (v: string) => void }) {
-  return (
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-mark">CX</div><div><strong>Control Center</strong><small>Codex orchestration</small></div></div>
-      <nav>
-        <button className={active === "sessions" ? "active" : ""} onClick={() => onChange("sessions")}><Activity size={18} />Sessions</button>
-        <button className={active === "accounts" ? "active" : ""} onClick={() => onChange("accounts")}><Server size={18} />Accounts</button>
-        <button className={active === "settings" ? "active" : ""} onClick={() => onChange("settings")}><Settings size={18} />Settings</button>
-      </nav>
-      <div className="sidebar-footer"><span className="pulse" /> supervisor ready</div>
-    </aside>
-  );
+function SessionDetail({ session, accounts, update }: { session:Session; accounts:Account[]; update:(s:Session)=>void }) {
+  const current=accounts.find(a=>a.id===session.accountId); const ready=accounts.filter(a=>a.id!==session.accountId&&a.status==="ready"&&a.sharedSessionsReady); const [target,setTarget]=useState(ready[0]?.id || ""); const [busy,setBusy]=useState(false);
+  useEffect(()=>{ if(!ready.some(a=>a.id===target)) setTarget(ready[0]?.id || ""); },[session.accountId,accounts.length]);
+  return <section className="detail-card"><div className="detail-header"><div><div className="eyebrow">MANAGED SESSION</div><h1>{session.name}</h1><div className="subtitle"><span className={`status-dot ${session.status}`}/>{session.status} · {session.runtime}</div></div></div>
+    <div className="metric-grid"><div className="metric"><Activity size={17}/><span>Runtime</span><strong>{session.pid?`PID ${session.pid}`:"Detached"}</strong></div><div className="metric"><ShieldCheck size={17}/><span>Thread</span><strong>{session.threadId || "Not captured"}</strong></div><div className="metric"><Gauge size={17}/><span>Quota</span><strong>{current?.remainingPercent==null?"Unknown":`${current.remainingPercent}%`}</strong></div><div className="metric"><RotateCw size={17}/><span>Failover</span><strong>{session.autoFailover?"Automatic":"Manual"}</strong></div></div>
+    <div className="path-box"><span>Project</span><code>{session.projectPath}</code></div><div className="failover-panel"><div className="panel-copy"><div className="eyebrow">ACCOUNT FAILOVER</div><h3>Switch & Resume</h3><p>CX terminates the old runtime, selects another isolated account home, and resumes the same captured thread from the shared session store.</p></div>
+      <div className="switch-controls"><div className="current-account"><small>Current</small><Badge account={current}/></div><span className="arrow">→</span><select value={target} onChange={e=>setTarget(e.target.value)}><option value="">Prepared target</option>{ready.map(a=><option key={a.id} value={a.id}>{a.name} · {a.remainingPercent ?? "?"}%</option>)}</select><button className="primary" disabled={!target||busy} onClick={async()=>{setBusy(true);try{update(await switchAccount(session.id,target))}finally{setBusy(false)}}}><RotateCw size={16}/>{busy?"Switching":"Switch & Resume"}</button></div>
+      <label className="toggle-row"><span><strong>Automatic quota failover</strong><small>Watch account logs for limit errors and migrate this session automatically.</small></span><input type="checkbox" checked={session.autoFailover} onChange={async()=>update(await setAutoFailover(session.id,!session.autoFailover))}/></label></div>
+    <div className="live-log"><div className="log-head"><span>SUPERVISOR</span><span className="live"><i/>watching</span></div><pre>{`runtime: ${session.pid || "—"}\naccount: ${current?.name || "unassigned"}\nlast: ${session.lastMessage || "waiting"}\nauto failover: ${session.autoFailover ? "enabled" : "disabled"}`}</pre></div></section>;
 }
 
-function AccountBadge({ account }: { account?: Account }) {
-  if (!account) return <span className="chip muted">unassigned</span>;
-  return <span className={`chip ${account.status}`}>{account.name}</span>;
+function Accounts({ accounts, setAccounts }: { accounts:Account[]; setAccounts:(x:Account[])=>void }) {
+  const [name,setName]=useState(""); const [home,setHome]=useState("~/.cx/accounts/");
+  return <div className="page-card"><div className="page-title"><div><div className="eyebrow">ACCOUNT POOL</div><h1>Accounts</h1><p>Authentication stays isolated. Only session rollout data is shared for recovery.</p></div></div><div className="add-form"><input placeholder="Account name" value={name} onChange={e=>setName(e.target.value)}/><input placeholder="CODEX_HOME" value={home} onChange={e=>setHome(e.target.value)}/><button className="primary" onClick={async()=>{if(name&&home){const a=await addAccount(name,home);setAccounts([...accounts,a]);setName("")}}}><Plus size={16}/>Add</button></div>
+    <div className="account-table"><div className="account-tr header"><span>Name</span><span>Status</span><span>Quota</span><span>Active</span><span>CODEX_HOME / recovery</span></div>{accounts.map(a=><div className="account-tr" key={a.id}><strong>{a.name}</strong><span className={`chip ${a.status}`}>{a.status}</span><span>{a.remainingPercent==null?"—":`${a.remainingPercent}%`}</span><span>{a.activeSessions}</span><div><code>{a.codexHome}</code><div className="prepare-row">{a.sharedSessionsReady?<span className="chip ready">shared sessions ready</span>:<button className="secondary" onClick={async()=>{const next=await prepareAccount(a.id);setAccounts(accounts.map(x=>x.id===next.id?next:x))}}>Prepare for CX</button>}</div></div></div>)}</div></div>;
 }
 
-function SessionList({ sessions, selected, onSelect, accounts }: { sessions: Session[]; selected?: string; onSelect: (id: string) => void; accounts: Account[] }) {
-  return <div className="session-list">
-    {sessions.map((session) => {
-      const account = accounts.find((a) => a.id === session.accountId);
-      return <button key={session.id} className={`session-row ${selected === session.id ? "selected" : ""}`} onClick={() => onSelect(session.id)}>
-        <div className="session-title"><StatusDot status={session.status} /><strong>{session.name}</strong><span>{timeAgo(session.lastActivityAt)}</span></div>
-        <div className="session-meta"><AccountBadge account={account} /><span>{session.runtime}</span>{session.pid && <span>PID {session.pid}</span>}</div>
-        <p>{session.lastMessage || "No recent activity"}</p>
-      </button>;
-    })}
-  </div>;
-}
+function SettingsPage(){return <div className="page-card"><div className="page-title"><div><div className="eyebrow">POLICY</div><h1>Settings</h1><p>Automatic failover currently chooses the prepared ready account with the highest known quota, then the fewest active sessions.</p></div></div><div className="settings-grid"><div><label>Watchdog interval</label><input value="5 seconds" readOnly/></div><div><label>Quota source</label><input value="CODEX_HOME log/codex-tui.log" readOnly/></div><div className="wide"><label>Important</label><textarea readOnly value="Prepare each account before enabling automatic failover. CX backs up the account's existing sessions folder, imports its rollouts into ~/.cx-control-center/shared-codex/sessions, and replaces only the sessions folder with a symlink. Authentication files are never shared."/></div></div></div>}
 
-function SessionDetail({ session, accounts, onChanged }: { session: Session; accounts: Account[]; onChanged: (s: Session) => void }) {
-  const current = accounts.find((a) => a.id === session.accountId);
-  const [switching, setSwitching] = useState(false);
-  const [target, setTarget] = useState(accounts.find((a) => a.status === "ready" && a.id !== session.accountId)?.id || "");
-
-  async function doSwitch() {
-    if (!target) return;
-    setSwitching(true);
-    try { onChanged(await switchAccount(session.id, target)); } finally { setSwitching(false); }
-  }
-
-  async function toggleAuto() {
-    onChanged(await setAutoFailover(session.id, !session.autoFailover));
-  }
-
-  return <section className="detail-card">
-    <div className="detail-header">
-      <div><div className="eyebrow">SESSION</div><h1>{session.name}</h1><div className="subtitle"><StatusDot status={session.status} />{statusLabel[session.status]} · {session.runtime}</div></div>
-      <div className="actions"><button className="secondary"><TerminalSquare size={16}/>Open Terminal</button><button className="secondary"><CirclePause size={16}/>Pause</button></div>
-    </div>
-
-    <div className="metric-grid">
-      <div className="metric"><Cpu size={17}/><span>Runtime</span><strong>{session.pid ? `PID ${session.pid}` : "Detached"}</strong></div>
-      <div className="metric"><GitBranch size={17}/><span>Thread</span><strong>{session.threadId || "Not captured"}</strong></div>
-      <div className="metric"><Gauge size={17}/><span>Account quota</span><strong>{current?.remainingPercent == null ? "Unknown" : `${current.remainingPercent}%`}</strong></div>
-      <div className="metric"><ShieldCheck size={17}/><span>Failover</span><strong>{session.autoFailover ? "Automatic" : "Manual"}</strong></div>
-    </div>
-
-    <div className="path-box"><span>Project</span><code>{session.projectPath}</code></div>
-
-    <div className="failover-panel">
-      <div className="panel-copy"><div className="eyebrow">ACCOUNT FAILOVER</div><h3>Switch & Resume</h3><p>The session remains the unit of work. CX restarts the runtime under another isolated CODEX_HOME and resumes the captured thread.</p></div>
-      <div className="switch-controls">
-        <div className="current-account"><small>Current account</small><AccountBadge account={current} /></div>
-        <span className="arrow">→</span>
-        <select value={target} onChange={(e) => setTarget(e.target.value)}>
-          <option value="">Select target</option>
-          {accounts.filter((a) => a.id !== session.accountId && a.status === "ready").map((a) => <option key={a.id} value={a.id}>{a.name} · {a.remainingPercent ?? "?"}%</option>)}
-        </select>
-        <button className="primary" disabled={!target || switching} onClick={doSwitch}><RotateCw size={16} className={switching ? "spin" : ""}/>{switching ? "Switching" : "Switch & Resume"}</button>
-      </div>
-      <label className="toggle-row"><span><strong>Automatic quota failover</strong><small>When a quota/rate-limit failure is detected, pick the best ready account and resume this session.</small></span><input type="checkbox" checked={session.autoFailover} onChange={toggleAuto}/></label>
-    </div>
-
-    <div className="live-log"><div className="log-head"><span>LIVE ACTIVITY</span><span className="live"><i/>streaming</span></div><pre>{`11:31  attached runtime ${session.pid || "—"}\n11:32  ${session.lastMessage || "waiting for activity"}\n11:34  supervisor heartbeat ok\n11:35  failover policy: ${session.autoFailover ? "automatic" : "manual"}`}</pre></div>
-  </section>;
-}
-
-function AccountsPage({ accounts, onAdd }: { accounts: Account[]; onAdd: (a: Account) => void }) {
-  const [show, setShow] = useState(false);
-  const [name, setName] = useState("");
-  const [home, setHome] = useState("~/.cx/accounts/");
-  return <div className="page-card">
-    <div className="page-title"><div><div className="eyebrow">ACCOUNT POOL</div><h1>Accounts</h1><p>Each account owns an isolated CODEX_HOME. Credentials are never copied between accounts.</p></div><button className="primary" onClick={() => setShow(!show)}><Plus size={16}/>Add account</button></div>
-    {show && <div className="add-form"><input placeholder="Display name" value={name} onChange={(e)=>setName(e.target.value)}/><input placeholder="CODEX_HOME" value={home} onChange={(e)=>setHome(e.target.value)}/><button className="primary" onClick={async()=>{ if(name && home){onAdd(await addAccount(name, home)); setShow(false); setName("");}}}>Save</button></div>}
-    <div className="account-table"><div className="account-tr header"><span>Name</span><span>Status</span><span>Quota</span><span>Active</span><span>CODEX_HOME</span></div>{accounts.map(a=><div className="account-tr" key={a.id}><strong>{a.name}</strong><span className={`chip ${a.status}`}>{a.status}</span><span>{a.remainingPercent == null ? "—" : `${a.remainingPercent}%`}</span><span>{a.activeSessions}</span><code>{a.codexHome}</code></div>)}</div>
-  </div>;
-}
-
-function SettingsPage() {
-  return <div className="page-card"><div className="page-title"><div><div className="eyebrow">POLICY</div><h1>Settings</h1><p>Defaults for runtime recovery and account scheduling.</p></div></div><div className="settings-grid"><div><label>Failover strategy</label><select defaultValue="quota"><option value="quota">Highest remaining quota</option><option value="least">Least active sessions</option><option value="round">Round robin</option></select></div><div><label>Default runtime</label><select defaultValue="spine"><option value="spine">spine-codex</option><option value="codex">codex</option></select></div><div className="wide"><label>Recovery prompt</label><textarea defaultValue="Continue the interrupted task from where it stopped. Inspect the current working tree and previous session context. Do not redo completed work. Continue until the original task is complete and verify the result."/></div></div></div>;
-}
-
-export default function App() {
-  const [overview, setOverview] = useState<Overview>({sessions: [], accounts: []});
-  const [active, setActive] = useState("sessions");
-  const [selected, setSelected] = useState<string>();
-  const [loading, setLoading] = useState(true);
-
-  async function refresh() {
-    setLoading(true); const data = await getOverview(); setOverview(data); setSelected((s) => s || data.sessions[0]?.id); setLoading(false);
-  }
-  useEffect(() => { refresh(); }, []);
-  const session = useMemo(() => overview.sessions.find((s) => s.id === selected), [overview.sessions, selected]);
-  const replaceSession = (next: Session) => setOverview((o) => ({...o, sessions: o.sessions.map((s)=>s.id===next.id?next:s)}));
-
-  async function discover() {
-    const found = await scanExisting();
-    setOverview((o) => ({...o, sessions: [...o.sessions, ...found.filter(f=>!o.sessions.some(s=>s.pid && s.pid===f.pid))]}));
-  }
-
-  return <div className="app-shell"><Sidebar active={active} onChange={setActive}/><main>
-    <header className="topbar"><div><span className="workspace">LOCAL WORKSPACE</span><span className="health"><i/>Supervisor online</span></div><div className="top-actions"><button className="secondary" onClick={discover}><Zap size={15}/>Discover runtimes</button><button className="icon-btn" onClick={refresh}><RefreshCw size={17} className={loading ? "spin" : ""}/></button></div></header>
-    {active === "sessions" && <div className="sessions-layout"><div className="left-pane"><div className="pane-head"><div><h2>Sessions</h2><span>{overview.sessions.filter(s=>s.status==="running").length} active</span></div></div><SessionList sessions={overview.sessions} selected={selected} onSelect={setSelected} accounts={overview.accounts}/></div><div className="content-pane">{session ? <SessionDetail session={session} accounts={overview.accounts} onChanged={replaceSession}/> : <div className="empty">No session selected</div>}</div></div>}
-    {active === "accounts" && <AccountsPage accounts={overview.accounts} onAdd={(a)=>setOverview(o=>({...o, accounts:[...o.accounts,a]}))}/>} 
-    {active === "settings" && <SettingsPage/>}
-  </main></div>;
+export default function App(){
+  const [overview,setOverview]=useState<Overview>({sessions:[],accounts:[]}); const [active,setActive]=useState("sessions"); const [selected,setSelected]=useState<string>(); const [found,setFound]=useState<Session[]>([]); const [notice,setNotice]=useState(""); const [loading,setLoading]=useState(false);
+  const refresh=async()=>{setLoading(true);try{const x=await getOverview();setOverview(x);setSelected(s=>s||x.sessions[0]?.id)}finally{setLoading(false)}};
+  useEffect(()=>{refresh();const t=window.setInterval(async()=>{try{const tick=await supervisorTick();if(tick.changedAccounts.length)setOverview(o=>({...o,accounts:tick.changedAccounts}));if(tick.changedSessions.length)setOverview(o=>({...o,sessions:o.sessions.map(s=>tick.changedSessions.find(c=>c.id===s.id)||s)}));if(tick.notices[0])setNotice(tick.notices[0])}catch{}},5000);return()=>clearInterval(t)},[]);
+  const session=useMemo(()=>overview.sessions.find(s=>s.id===selected),[overview.sessions,selected]); const update=(next:Session)=>setOverview(o=>({...o,sessions:o.sessions.map(s=>s.id===next.id?next:s)}));
+  return <div className="app-shell"><Sidebar active={active} setActive={setActive}/><main><header className="topbar"><div><span className="workspace">LOCAL WORKSPACE</span><span className="health"><i/>Supervisor online</span></div><div className="top-actions"><button className="secondary" onClick={async()=>setFound((await scanExisting()).filter(f=>!overview.sessions.some(s=>s.managed&&s.pid===f.pid)))}><Zap size={15}/>Discover & Attach</button><button className="icon-btn" onClick={refresh}><RefreshCw size={17} className={loading?"spin":""}/></button></div></header>{notice&&<div className="notice">{notice}</div>}
+    {active==="sessions"&&<div className="sessions-layout"><div className="left-pane"><div className="pane-head"><div><h2>Sessions</h2><span>{overview.sessions.filter(s=>s.status==="running").length} active</span></div></div><div className="session-list">{overview.sessions.map(s=><button className={`session-row ${selected===s.id?"selected":""}`} key={s.id} onClick={()=>setSelected(s.id)}><div className="session-title"><span className={`status-dot ${s.status}`}/><strong>{s.name}</strong><span>{timeAgo(s.lastActivityAt)}</span></div><div className="session-meta"><Badge account={overview.accounts.find(a=>a.id===s.accountId)}/><span>{s.runtime}</span>{s.pid&&<span>PID {s.pid}</span>}</div><p>{s.lastMessage||"No recent activity"}</p></button>)}</div></div><div className="content-pane">{session?<SessionDetail session={session} accounts={overview.accounts} update={update}/>:<div className="empty">Discover and attach a running Codex session, or add accounts first.</div>}</div></div>}
+    {active==="accounts"&&<Accounts accounts={overview.accounts} setAccounts={accounts=>setOverview(o=>({...o,accounts}))}/>} {active==="settings"&&<SettingsPage/>}</main>{found.length>0&&<AttachModal found={found} accounts={overview.accounts} close={()=>setFound([])} attached={s=>{setOverview(o=>({...o,sessions:[...o.sessions,s]}));setSelected(s.id)}}/>}</div>;
 }
