@@ -170,6 +170,22 @@ fn choose_failover_account(data: &Overview, current: &str) -> Option<String> {
     candidates.first().map(|a| a.id.clone())
 }
 
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else if ty.is_file() && !dst.exists() {
+            fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn resume_session(data: &mut Overview, session_id: &str, account_id: &str) -> Result<Session, String> {
     let home = account_home(data, account_id)?;
     let idx = data
@@ -193,6 +209,22 @@ fn resume_session(data: &mut Overview, session_id: &str, account_id: &str) -> Re
         let _ = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+
+    // An already-running source account may not have been prepared for CX.
+    // After stopping it, copy its freshest rollout files into the shared store
+    // before launching the target account. This avoids mutating an active
+    // session directory just to make an existing task attachable.
+    if let Some(source_account_id) = snapshot.account_id.as_deref() {
+        if source_account_id != account_id {
+            if let Ok(source_home) = account_home(data, source_account_id) {
+                let source_sessions = source_home.join("sessions");
+                if source_sessions.exists() && !source_sessions.is_symlink() {
+                    copy_dir_recursive(&source_sessions, &shared_sessions_path())?;
+                }
+            }
+        }
     }
 
     let executable = if snapshot.runtime == "spine-codex" {
@@ -216,22 +248,6 @@ fn resume_session(data: &mut Overview, session_id: &str, account_id: &str) -> Re
     data.sessions[idx].last_message = Some(format!("resumed thread {thread}"));
     recompute_active_sessions(data);
     Ok(data.sessions[idx].clone())
-}
-
-fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), String> {
-    fs::create_dir_all(to).map_err(|e| e.to_string())?;
-    for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
-        let ty = entry.file_type().map_err(|e| e.to_string())?;
-        if ty.is_dir() {
-            copy_dir_recursive(&src, &dst)?;
-        } else if ty.is_file() && !dst.exists() {
-            fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -507,7 +523,7 @@ fn supervisor_tick(state: State<'_, AppState>) -> Result<SupervisorTick, String>
         let session_ids = data
             .sessions
             .iter()
-            .filter(|s| s.managed && s.auto_failover && s.account_id.as_deref() == Some(&exhausted_id))
+            .filter(|s| s.managed && s.auto_failover && s.account_id.as_deref() == Some(exhausted_id.as_str()))
             .map(|s| s.id.clone())
             .collect::<Vec<_>>();
         for session_id in session_ids {
