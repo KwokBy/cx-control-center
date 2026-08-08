@@ -40,6 +40,10 @@ struct Session {
     auto_failover: bool,
     #[serde(default)]
     thread_lineage: Vec<ThreadLineageEntry>,
+    #[serde(default)]
+    detected_codex_home: Option<String>,
+    #[serde(default)]
+    detection_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +122,7 @@ fn expand_home(value: &str) -> PathBuf {
     }
     PathBuf::from(value)
 }
+fn path_key(path: &Path) -> PathBuf { fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) }
 fn load_state() -> Overview {
     fs::read_to_string(store_path()).ok().and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()
 }
@@ -130,13 +135,53 @@ fn now_iso() -> String {
     format!("unix:{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
 }
 fn process_cwd(pid: u32) -> Option<String> {
-    let output = Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
+    let pid_s = pid.to_string();
+    let output = Command::new("lsof").args(["-a", "-p", &pid_s, "-d", "cwd", "-Fn"]).output().ok()?;
     String::from_utf8_lossy(&output.stdout).lines().find_map(|line| line.strip_prefix('n').map(ToOwned::to_owned))
 }
 fn process_command(pid: u32) -> Option<String> {
-    let output = Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]).output().ok()?;
+    let pid_s = pid.to_string();
+    let output = Command::new("ps").args(["-p", &pid_s, "-o", "command="]).output().ok()?;
     let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!command.is_empty()).then_some(command)
+}
+fn env_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let start = text.find(&needle)? + needle.len();
+    let tail = &text[start..];
+    let raw = tail.split_whitespace().next()?.trim_matches(|c| c == '\'' || c == '"');
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+fn process_codex_home(pid: u32) -> Option<(PathBuf, String)> {
+    let pid_s = pid.to_string();
+    if let Ok(output) = Command::new("ps").args(["eww", "-p", &pid_s, "-o", "command="]).output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Some(home) = env_value(&text, "CODEX_HOME") {
+            return Some((expand_home(&home), "CODEX_HOME environment".into()));
+        }
+    }
+    if let Ok(output) = Command::new("lsof").args(["-p", &pid_s, "-Fn"]).output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some(raw) = line.strip_prefix('n') else { continue; };
+            if let Some(pos) = raw.find("/sessions/") {
+                return Some((PathBuf::from(&raw[..pos]), "open Codex rollout path".into()));
+            }
+            if raw.ends_with("/auth.json") {
+                if let Some(parent) = Path::new(raw).parent() {
+                    return Some((parent.to_path_buf(), "open Codex auth file".into()));
+                }
+            }
+        }
+    }
+    None
+}
+fn account_id_for_home(data: &Overview, home: &Path) -> Option<String> {
+    let wanted = path_key(home);
+    data.accounts.iter().find(|a| path_key(&expand_home(&a.codex_home)) == wanted).map(|a| a.id.clone())
+}
+fn default_account_id(data: &Overview) -> Option<String> {
+    let default = dirs::home_dir()?.join(".codex");
+    account_id_for_home(data, &default)
 }
 fn recompute_active_sessions(data: &mut Overview) {
     let counts = data.sessions.iter().filter(|s| s.status == "running" || s.status == "recovering")
@@ -194,7 +239,7 @@ fn thread_candidates_for(home: &Path, account_id: Option<&str>, cwd: Option<&str
         let modified_at = fs::metadata(&path).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
         let mut score = 20u8; let mut reasons = vec!["valid Codex rollout metadata".to_string()];
         if let (Some(expected),Some(actual)) = (cwd,meta_cwd.as_deref()) {
-            if Path::new(expected) == Path::new(actual) { score = score.saturating_add(60); reasons.push("cwd exact match".into()); }
+            if path_key(Path::new(expected)) == path_key(Path::new(actual)) { score = score.saturating_add(60); reasons.push("cwd exact match".into()); }
             else if actual.starts_with(expected) || expected.starts_with(actual) { score = score.saturating_add(25); reasons.push("cwd related".into()); }
         }
         let age = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(modified_at);
@@ -239,7 +284,7 @@ fn resume_session(data:&mut Overview,session_id:&str,account_id:&str,automatic:b
     if let Some(pid)=snapshot.pid{let _=Command::new("kill").args(["-TERM",&pid.to_string()]).status();std::thread::sleep(std::time::Duration::from_millis(350));}
     if let Some(source)=snapshot.account_id.as_deref(){if source!=account_id{if let Ok(source_home)=account_home(data,source){let source_sessions=source_home.join("sessions");if source_sessions.exists()&&!source_sessions.is_symlink(){copy_dir_recursive(&source_sessions,&shared_sessions_path())?;}}}}
     let executable=if snapshot.runtime=="spine-codex"{"spine-codex"}else{"codex"};let child=Command::new(executable).arg("resume").arg(&thread).env("CODEX_HOME",&home).current_dir(&snapshot.project_path).spawn().map_err(|e|format!("failed to resume {executable}: {e}"))?;
-    data.sessions[idx].pid=Some(child.id());data.sessions[idx].account_id=Some(account_id.to_string());data.sessions[idx].status="running".into();data.sessions[idx].last_activity_at=now_iso();data.sessions[idx].last_message=Some(format!("resumed thread {thread}"));
+    data.sessions[idx].pid=Some(child.id());data.sessions[idx].account_id=Some(account_id.to_string());data.sessions[idx].status="running".into();data.sessions[idx].last_activity_at=now_iso();data.sessions[idx].last_message=Some(format!("resumed thread {thread}"));data.sessions[idx].detected_codex_home=Some(home.to_string_lossy().into());data.sessions[idx].detection_reasons=vec!["CX launched runtime with target CODEX_HOME".into()];
     if data.sessions[idx].thread_lineage.iter().all(|x|x.thread_id!=thread){data.sessions[idx].thread_lineage.push(ThreadLineageEntry{thread_id:thread.clone(),parent_thread_id:None,account_id:snapshot.account_id.clone(),rollout_path:None,discovered_at:now_iso()});}
     recompute_active_sessions(data);let session=data.sessions[idx].clone();let event=append_event(data,session_id,"failover",snapshot.account_id.clone(),Some(account_id.to_string()),Some(thread.clone()),Some(thread.clone()),format!("resumed {thread} under {account_id}"),automatic);Ok((session,event))
 }
@@ -248,9 +293,32 @@ fn resume_session(data:&mut Overview,session_id:&str,account_id:&str,automatic:b
 #[tauri::command] fn add_account(name:String,codex_home:String,state:State<'_,AppState>)->Result<Account,String>{let account=Account{id:format!("account-{}",Uuid::new_v4()),name,codex_home,status:"ready".into(),remaining_percent:None,cooldown_until:None,active_sessions:0,shared_sessions_ready:false,log_cursor:0};let mut data=state.0.lock().map_err(|e|e.to_string())?;data.accounts.push(account.clone());persist(&data)?;Ok(account)}
 #[tauri::command] fn prepare_account(account_id:String,state:State<'_,AppState>)->Result<Account,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;let idx=data.accounts.iter().position(|a|a.id==account_id).ok_or("account not found")?;let home=expand_home(&data.accounts[idx].codex_home);prepare_shared_sessions(&home)?;data.accounts[idx].shared_sessions_ready=true;let result=data.accounts[idx].clone();persist(&data)?;Ok(result)}
 #[tauri::command] fn set_auto_failover(session_id:String,enabled:bool,state:State<'_,AppState>)->Result<Session,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;let session=data.sessions.iter_mut().find(|s|s.id==session_id).ok_or("session not found")?;session.auto_failover=enabled;let result=session.clone();persist(&data)?;Ok(result)}
-#[tauri::command] fn scan_existing_runtimes()->Result<Vec<Session>,String>{let output=Command::new("ps").args(["-axo","pid=,etime=,command="]).output().map_err(|e|format!("failed to run ps: {e}"))?;let text=String::from_utf8_lossy(&output.stdout);let mut found=Vec::new();for line in text.lines(){let lower=line.to_lowercase();if !(lower.contains("spine-codex")||lower.contains("codex"))||lower.contains("cx-control-center"){continue;}let mut parts=line.trim().split_whitespace();let Some(pid_text)=parts.next()else{continue};let Ok(pid)=pid_text.parse::<u32>()else{continue};let _=parts.next();let command=parts.collect::<Vec<_>>().join(" ");let runtime=if lower.contains("spine-codex"){"spine-codex"}else{"codex"};found.push(Session{id:format!("discovered-{pid}"),name:format!("{} · {}",runtime,pid),project_path:process_cwd(pid).unwrap_or_else(||"unknown".into()),thread_id:None,pid:Some(pid),runtime:runtime.into(),status:"running".into(),account_id:None,started_at:now_iso(),last_activity_at:now_iso(),last_message:Some(process_command(pid).unwrap_or(command)),managed:false,auto_failover:false,thread_lineage:vec![]});}Ok(found)}
+
+#[tauri::command]
+fn scan_existing_runtimes(state:State<'_,AppState>)->Result<Vec<Session>,String>{
+    let data=state.0.lock().map_err(|e|e.to_string())?;
+    let output=Command::new("ps").args(["-axo","pid=,etime=,command="]).output().map_err(|e|format!("failed to run ps: {e}"))?;
+    let text=String::from_utf8_lossy(&output.stdout);let mut found=Vec::new();
+    for line in text.lines(){
+        let lower=line.to_lowercase();if !(lower.contains("spine-codex")||lower.contains("codex"))||lower.contains("cx-control-center"){continue;}
+        let mut parts=line.trim().split_whitespace();let Some(pid_text)=parts.next()else{continue};let Ok(pid)=pid_text.parse::<u32>()else{continue};let _=parts.next();let command=parts.collect::<Vec<_>>().join(" ");let runtime=if lower.contains("spine-codex"){"spine-codex"}else{"codex"};let project_path=process_cwd(pid).unwrap_or_else(||"unknown".into());
+        let mut reasons=Vec::new();let mut detected_home=None;let mut account_id=None;
+        if let Some((home,reason))=process_codex_home(pid){account_id=account_id_for_home(&data,&home);detected_home=Some(home);reasons.push(reason);if account_id.is_some(){reasons.push("CODEX_HOME matched registered account".into());}}
+        if account_id.is_none()&&detected_home.is_none(){if let Some(id)=default_account_id(&data){account_id=Some(id);detected_home=dirs::home_dir().map(|h|h.join(".codex"));reasons.push("no explicit CODEX_HOME; matched default ~/.codex account".into());}}
+        let mut thread_id=None;
+        if let Some(id)=account_id.as_deref(){if let Ok(home)=account_home(&data,id){if let Some(best)=thread_candidates_for(&home,Some(id),Some(&project_path)).into_iter().next(){if best.confidence>=70{thread_id=Some(best.thread_id.clone());reasons.push(format!("thread auto-selected at {}% confidence",best.confidence));}}}}
+        if account_id.is_none(){
+            let mut all=Vec::new();for a in &data.accounts{for c in thread_candidates_for(&expand_home(&a.codex_home),Some(&a.id),Some(&project_path)){all.push(c);}}
+            all.sort_by(|a,b|b.confidence.cmp(&a.confidence).then(b.modified_at.cmp(&a.modified_at)));
+            if let Some(best)=all.first(){let second=all.iter().find(|c|c.account_id!=best.account_id);let unique=best.confidence>=85&&second.map(|c|best.confidence.saturating_sub(c.confidence)>=10).unwrap_or(true);if unique{account_id=best.account_id.clone();thread_id=Some(best.thread_id.clone());reasons.push(format!("account inferred from unique rollout match ({}%)",best.confidence));}}
+        }
+        found.push(Session{id:format!("discovered-{pid}"),name:format!("{} · {}",runtime,pid),project_path,thread_id,pid:Some(pid),runtime:runtime.into(),status:"running".into(),account_id,started_at:now_iso(),last_activity_at:now_iso(),last_message:Some(process_command(pid).unwrap_or(command)),managed:false,auto_failover:false,thread_lineage:vec![],detected_codex_home:detected_home.map(|p|p.to_string_lossy().into()),detection_reasons:reasons});
+    }
+    Ok(found)
+}
+
 #[tauri::command] fn discover_threads(project_path:String,account_id:Option<String>,state:State<'_,AppState>)->Result<Vec<ThreadCandidate>,String>{let data=state.0.lock().map_err(|e|e.to_string())?;let mut all=Vec::new();if let Some(id)=account_id{let home=account_home(&data,&id)?;all.extend(thread_candidates_for(&home,Some(&id),Some(&project_path)));}else{for a in &data.accounts{all.extend(thread_candidates_for(&expand_home(&a.codex_home),Some(&a.id),Some(&project_path)));}}all.sort_by(|a,b|b.confidence.cmp(&a.confidence).then(b.modified_at.cmp(&a.modified_at)));all.truncate(12);Ok(all)}
-#[tauri::command] fn attach_session(pid:u32,name:String,project_path:String,thread_id:String,account_id:String,runtime:String,state:State<'_,AppState>)->Result<Session,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;if data.accounts.iter().all(|a|a.id!=account_id){return Err("account not found".into());}if data.sessions.iter().any(|s|s.pid==Some(pid)&&s.managed){return Err("this runtime is already attached".into());}let candidate=thread_candidates_for(&account_home(&data,&account_id)?,Some(&account_id),Some(&project_path)).into_iter().find(|c|c.thread_id==thread_id);let lineage=vec![ThreadLineageEntry{thread_id:thread_id.clone(),parent_thread_id:candidate.as_ref().and_then(|c|c.parent_thread_id.clone()),account_id:Some(account_id.clone()),rollout_path:candidate.as_ref().map(|c|c.rollout_path.clone()),discovered_at:now_iso()}];let session=Session{id:format!("session-{}",Uuid::new_v4()),name,project_path,thread_id:Some(thread_id.clone()),pid:Some(pid),runtime,status:"running".into(),account_id:Some(account_id.clone()),started_at:now_iso(),last_activity_at:now_iso(),last_message:Some("attached existing runtime".into()),managed:true,auto_failover:false,thread_lineage:lineage};data.sessions.push(session.clone());recompute_active_sessions(&mut data);append_event(&mut data,&session.id,"attach",None,Some(account_id),None,Some(thread_id),"attached existing runtime".into(),false);persist(&data)?;Ok(session)}
+#[tauri::command] fn attach_session(pid:u32,name:String,project_path:String,thread_id:String,account_id:String,runtime:String,state:State<'_,AppState>)->Result<Session,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;if data.accounts.iter().all(|a|a.id!=account_id){return Err("account not found".into());}if data.sessions.iter().any(|s|s.pid==Some(pid)&&s.managed){return Err("this runtime is already attached".into());}let candidate=thread_candidates_for(&account_home(&data,&account_id)?,Some(&account_id),Some(&project_path)).into_iter().find(|c|c.thread_id==thread_id);let lineage=vec![ThreadLineageEntry{thread_id:thread_id.clone(),parent_thread_id:candidate.as_ref().and_then(|c|c.parent_thread_id.clone()),account_id:Some(account_id.clone()),rollout_path:candidate.as_ref().map(|c|c.rollout_path.clone()),discovered_at:now_iso()}];let home=account_home(&data,&account_id)?;let session=Session{id:format!("session-{}",Uuid::new_v4()),name,project_path,thread_id:Some(thread_id.clone()),pid:Some(pid),runtime,status:"running".into(),account_id:Some(account_id.clone()),started_at:now_iso(),last_activity_at:now_iso(),last_message:Some("attached existing runtime".into()),managed:true,auto_failover:false,thread_lineage:lineage,detected_codex_home:Some(home.to_string_lossy().into()),detection_reasons:vec!["account and thread confirmed at attach".into()]};data.sessions.push(session.clone());recompute_active_sessions(&mut data);append_event(&mut data,&session.id,"attach",None,Some(account_id),None,Some(thread_id),"attached existing runtime".into(),false);persist(&data)?;Ok(session)}
 #[tauri::command] fn switch_session_account(session_id:String,account_id:String,state:State<'_,AppState>)->Result<Session,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;let target=data.accounts.iter().find(|a|a.id==account_id).ok_or("target account not found")?;if !target.shared_sessions_ready{return Err("target account is not prepared for shared CX sessions".into());}let (result,_)=resume_session(&mut data,&session_id,&account_id,false)?;persist(&data)?;Ok(result)}
 #[tauri::command] fn supervisor_tick(state:State<'_,AppState>)->Result<SupervisorTick,String>{let mut data=state.0.lock().map_err(|e|e.to_string())?;let mut exhausted=Vec::new();let mut notices=Vec::new();let mut new_events=Vec::new();for idx in 0..data.accounts.len(){let home=expand_home(&data.accounts[idx].codex_home);let Some(log)=account_log_path(&home)else{continue};let cursor=data.accounts[idx].log_cursor;let Ok((delta,next))=read_log_delta(&log,cursor)else{continue};data.accounts[idx].log_cursor=next;if !delta.is_empty()&&quota_signal(&delta)&&data.accounts[idx].status!="exhausted"{data.accounts[idx].status="exhausted".into();data.accounts[idx].remaining_percent=Some(0);exhausted.push(data.accounts[idx].id.clone());notices.push(format!("quota signal detected for {}",data.accounts[idx].name));}}
 let mut changed_sessions=Vec::new();for exhausted_id in exhausted{let ids=data.sessions.iter().filter(|s|s.managed&&s.auto_failover&&s.account_id.as_deref()==Some(exhausted_id.as_str())).map(|s|s.id.clone()).collect::<Vec<_>>();for id in ids{let Some(target)=choose_failover_account(&data,&exhausted_id)else{notices.push(format!("no ready failover account for session {id}"));continue};match resume_session(&mut data,&id,&target,true){Ok((s,e))=>{notices.push(format!("{} failed over to {}",s.name,target));changed_sessions.push(s);new_events.push(e)},Err(error)=>{let e=append_event(&mut data,&id,"failover_failed",Some(exhausted_id.clone()),Some(target.clone()),None,None,error.clone(),true);new_events.push(e);notices.push(format!("failover failed for {id}: {error}"));}}}}
