@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import sys
+
+
+def load_state():
+    path = pathlib.Path.home() / ".cx-control-center" / "state.json"
+    if not path.exists():
+        raise SystemExit(f"CX state not found: {path}. Add accounts in CX Control Center first.")
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        raise SystemExit(f"Failed to read {path}: {exc}")
+
+
+def find_account(state, query):
+    accounts = state.get("accounts", [])
+    exact = [a for a in accounts if a.get("id") == query or a.get("name") == query]
+    if len(exact) == 1:
+        return exact[0]
+    folded = [a for a in accounts if str(a.get("name", "")).lower() == query.lower()]
+    if len(folded) == 1:
+        return folded[0]
+    names = ", ".join(a.get("name", a.get("id", "?")) for a in accounts) or "<none>"
+    raise SystemExit(f"Account '{query}' not found. Available: {names}")
+
+
+def expand(path):
+    return str(pathlib.Path(path).expanduser().resolve())
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Start Codex/SpineCodex with a CX-managed account")
+    parser.add_argument("--account", "-a", required=True, help="CX account name or id")
+    parser.add_argument("--project", "-p", default=os.getcwd(), help="Project directory")
+    parser.add_argument("--runtime", "-r", choices=["spine-codex", "codex"], default="spine-codex")
+    parser.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the runtime (use -- before them)")
+    ns = parser.parse_args()
+
+    state = load_state()
+    account = find_account(state, ns.account)
+    home = expand(account["codexHome"])
+    project = expand(ns.project)
+
+    if not pathlib.Path(home).exists():
+        raise SystemExit(f"CODEX_HOME does not exist: {home}")
+    if not pathlib.Path(project).is_dir():
+        raise SystemExit(f"Project directory does not exist: {project}")
+
+    runtime_args = ns.args
+    if runtime_args and runtime_args[0] == "--":
+        runtime_args = runtime_args[1:]
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = home
+    env["CX_ACCOUNT_ID"] = account.get("id", "")
+    env["CX_ACCOUNT_NAME"] = account.get("name", "")
+
+    print(f"[cx] account: {account.get('name')} ({home})", file=sys.stderr)
+    print(f"[cx] project: {project}", file=sys.stderr)
+    print(f"[cx] runtime: {ns.runtime}", file=sys.stderr)
+
+    os.chdir(project)
+    os.execvpe(ns.runtime, [ns.runtime, *runtime_args], env)
+
+
+if __name__ == "__main__":
+    main()
