@@ -24,6 +24,8 @@ export interface Session {
   managed: boolean;
   autoFailover: boolean;
   threadLineage: ThreadLineageEntry[];
+  detectedCodexHome?: string;
+  detectionReasons?: string[];
 }
 
 export interface Account {
