@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import json, os, pathlib, re, subprocess, sys, time, uuid
+
+STATE = pathlib.Path.home()/'.cx-control-center'/'state.json'
+THRESHOLD = 70
+
+def sh(*args):
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ''
+
+def expand(p):
+    return pathlib.Path(os.path.expanduser(p)).resolve()
+
+def load_state():
+    if not STATE.exists():
+        raise SystemExit(f'CX state not found: {STATE}. Add accounts in CX first.')
+    data=json.loads(STATE.read_text())
+    data.setdefault('sessions',[]); data.setdefault('accounts',[]); data.setdefault('events',[])
+    return data
+
+def proc_cwd(pid):
+    out=sh('lsof','-a','-p',str(pid),'-d','cwd','-Fn')
+    for line in out.splitlines():
+        if line.startswith('n'): return line[1:]
+    return None
+
+def proc_command(pid):
+    return sh('ps','-p',str(pid),'-o','command=').strip()
+
+def proc_env(pid):
+    # macOS ps eww normally exposes the process environment after argv.
+    return sh('ps','eww','-p',str(pid),'-o','command=').strip()
+
+def detect_home(pid, accounts):
+    env=proc_env(pid)
+    m=re.search(r'(?:^|\s)CODEX_HOME=([^\s]+)',env)
+    if m:
+        h=expand(m.group(1))
+        for a in accounts:
+            if expand(a['codexHome'])==h: return a,h,'CODEX_HOME environment'
+    files=sh('lsof','-p',str(pid),'-Fn')
+    for a in accounts:
+        h=expand(a['codexHome'])
+        hs=str(h)
+        if any(line.startswith('n'+hs+'/') and ('/sessions/' in line or line.endswith('/auth.json')) for line in files.splitlines()):
+            return a,h,'open Codex file path'
+    default=expand('~/.codex')
+    for a in accounts:
+        if expand(a['codexHome'])==default:
+            return a,default,'default ~/.codex'
+    return None,None,'account not detected'
+
+def rollout_meta(path):
+    try:
+        with path.open(errors='ignore') as f:
+            for _ in range(12):
+                line=f.readline()
+                if not line: break
+                try: v=json.loads(line)
+                except Exception: continue
+                p=v.get('payload',v)
+                if v.get('type')!='session_meta' and p.get('type')!='session_meta' and 'cwd' not in p: continue
+                tid=p.get('id') or p.get('session_id') or p.get('thread_id')
+                if not tid:
+                    m=re.search(r'([0-9a-fA-F-]{20,})$',path.stem); tid=m.group(1) if m else None
+                if tid:
+                    return tid,p.get('cwd'),p.get('forked_from_id') or p.get('forkedFromId')
+    except Exception: pass
+    return None
+
+def candidates(home,cwd):
+    root=home/'sessions'; out=[]
+    if not root.exists(): return out
+    for p in root.rglob('rollout-*.jsonl'):
+        meta=rollout_meta(p)
+        if not meta: continue
+        tid,mcwd,parent=meta; score=20; reasons=['valid rollout metadata']
+        if cwd and mcwd:
+            try:
+                ec=str(pathlib.Path(cwd).resolve()); ac=str(pathlib.Path(mcwd).resolve())
+            except Exception: ec,ac=cwd,mcwd
+            if ec==ac: score+=60; reasons.append('cwd exact match')
+            elif ec.startswith(ac) or ac.startswith(ec): score+=25; reasons.append('cwd related')
+        try: age=time.time()-p.stat().st_mtime
+        except Exception: age=999999
+        if age<300: score+=20; reasons.append('modified <5m')
+        elif age<3600: score+=10; reasons.append('modified <1h')
+        out.append((min(score,100),p.stat().st_mtime if p.exists() else 0,tid,mcwd,parent,str(p),reasons))
+    out.sort(reverse=True)
+    return out
+
+def event(data,sid,account,thread,msg):
+    data['events'].append({'id':'event-'+str(uuid.uuid4()),'sessionId':sid,'eventType':'attach','at':'unix:'+str(int(time.time())),'fromAccountId':None,'toAccountId':account,'fromThreadId':None,'toThreadId':thread,'message':msg,'automatic':True})
+
+def main():
+    data=load_state(); accounts=data['accounts']
+    if not accounts: raise SystemExit('No accounts registered in CX.')
+    existing_pids={s.get('pid') for s in data['sessions'] if s.get('managed')}
+    ps=sh('ps','-axo','pid=,command=')
+    attached=[]; review=[]
+    for line in ps.splitlines():
+        low=line.lower()
+        if ('codex' not in low and 'spine-codex' not in low) or 'cx-control-center' in low or 'cx-auto-attach' in low: continue
+        m=re.match(r'\s*(\d+)\s+(.*)',line)
+        if not m: continue
+        pid=int(m.group(1)); cmd=m.group(2)
+        if pid in existing_pids: continue
+        runtime='spine-codex' if 'spine-codex' in low else 'codex'
+        cwd=proc_cwd(pid)
+        acc,home,reason=detect_home(pid,accounts)
+        if not acc or not cwd:
+            review.append((pid,runtime,cwd or '?',reason)); continue
+        cs=candidates(home,cwd)
+        if not cs or cs[0][0]<THRESHOLD:
+            review.append((pid,runtime,cwd,f'no thread >= {THRESHOLD}%')); continue
+        score,_,tid,mcwd,parent,rpath,reasons=cs[0]
+        sid='session-'+str(uuid.uuid4())
+        name=pathlib.Path(cwd).name or f'{runtime}-{pid}'
+        sess={'id':sid,'name':name,'projectPath':cwd,'threadId':tid,'pid':pid,'runtime':runtime,'status':'running','accountId':acc['id'],'startedAt':'unix:'+str(int(time.time())),'lastActivityAt':'unix:'+str(int(time.time())),'lastMessage':f'auto-attached ({score}% thread confidence)','managed':True,'autoFailover':True,'threadLineage':[{'threadId':tid,'parentThreadId':parent,'accountId':acc['id'],'rolloutPath':rpath,'discoveredAt':'unix:'+str(int(time.time()))}],'detectedCodexHome':str(home),'detectionReasons':[reason,*reasons]}
+        data['sessions'].append(sess); event(data,sid,acc['id'],tid,f'bulk auto-attached PID {pid} with {score}% confidence')
+        attached.append((pid,name,acc['name'],tid,score))
+    # recompute active sessions
+    counts={}
+    for s in data['sessions']:
+        if s.get('status') in ('running','recovering') and s.get('accountId'): counts[s['accountId']]=counts.get(s['accountId'],0)+1
+    for a in data['accounts']: a['activeSessions']=counts.get(a['id'],0)
+    STATE.parent.mkdir(parents=True,exist_ok=True); STATE.write_text(json.dumps(data,indent=2,ensure_ascii=False))
+    print(f'Auto-attached: {len(attached)}')
+    for pid,name,acc,tid,score in attached: print(f'  ✓ PID {pid}  {name}  account={acc}  thread={tid}  confidence={score}%')
+    print(f'Needs review: {len(review)}')
+    for pid,rt,cwd,why in review: print(f'  ? PID {pid}  {rt}  {cwd}  {why}')
+
+if __name__=='__main__': main()
